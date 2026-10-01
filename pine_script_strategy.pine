@@ -1,0 +1,166 @@
+//@version=6
+indicator("Indicador MTF Techo 10D & Salida MACD [Pro HUD v6]", overlay=true)
+
+// =============================================================================
+// 1. CONFIGURACIÓN DE PARÁMETROS (INPUTS)
+// =============================================================================
+grp_str      = " Configuración del Indicador (Breakout MTF)"
+donchian_len = input.int(10, "Periodo Canal Donchian (Días)", minval=5, maxval=50, group=grp_str, tooltip="Número de días para calcular el Techo/Piso")
+use_cascade  = input.bool(true, "Activar Cascada MTF (1h -> 4h -> 1D)", group=grp_str)
+
+grp_macd     = " Parámetros del MACD (Salida)"
+macd_fast    = input.int(12, "MACD Fast Period", group=grp_macd)
+macd_slow    = input.int(26, "MACD Slow Period", group=grp_macd)
+macd_signal  = input.int(9,  "MACD Signal Period", group=grp_macd)
+
+grp_sl       = " Gestión de Riesgo (Stop Loss)"
+sl_mode      = input.string("Donchian Low 10D", "Modo de Stop Loss", options=["Donchian Low 10D", "ATR 1.0x", "ATR 1.5x", "Mínimo Vela Entrada"], group=grp_sl)
+atr_len      = input.int(14, "Periodo ATR", group=grp_sl)
+
+grp_vis      = " Estilo Visual y Tabla HUD"
+show_hud     = input.bool(true, "Mostrar Panel Estadístico HUD", group=grp_vis)
+show_lines   = input.bool(true, "Mostrar Líneas de Techo y Stop Loss", group=grp_vis)
+show_shapes  = input.bool(true, "Mostrar Etiquetas de Compra/Venta", group=grp_vis)
+
+// =============================================================================
+// 2. CÁLCULO DE INDICADORES EN MULTI-TIMEFRAME (PINE SCRIPT V6)
+// =============================================================================
+// Techo y Piso Donchian en temporalidad Diaria (1D)
+donchian_high_1d = request.security(syminfo.tickerid, "D", ta.highest(high, donchian_len)[1], lookahead=barmerge.lookahead_on)
+donchian_low_1d  = request.security(syminfo.tickerid, "D", ta.lowest(low, donchian_len)[1], lookahead=barmerge.lookahead_on)
+atr_val_1d       = request.security(syminfo.tickerid, "D", ta.atr(atr_len)[1], lookahead=barmerge.lookahead_on)
+
+// MACD en la temporalidad actual del gráfico
+[macd_line, signal_line, _] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+macd_bear_cross = ta.crossunder(macd_line, signal_line)
+
+// =============================================================================
+// 3. LÓGICA DE ACTIVACIÓN Y SEÑALES
+// =============================================================================
+var float entry_price  = na
+var float sl_price     = na
+var string entry_tf    = ""
+var bool touched_today = false
+var bool in_position   = false
+
+// Estadísticas para el HUD
+var int total_trades  = 0
+var int win_trades    = 0
+var float total_return = 0.0
+
+// Detectar cambio de día
+is_new_day = ta.change(time("D")) != 0
+if is_new_day
+    touched_today := false
+
+// Condición 1: Roce o toque del techo de 10D durante el día
+if high >= donchian_high_1d
+    touched_today := true
+
+// Condición 2: Cascada de confirmación por cierre de vela
+buy_signal_1h = touched_today and close > donchian_high_1d and (timeframe.isintraday and timeframe.multiplier <= 60)
+buy_signal_4h = touched_today and close > donchian_high_1d and (timeframe.isintraday and timeframe.multiplier > 60 and timeframe.multiplier <= 240)
+buy_signal_1d = touched_today and close > donchian_high_1d and timeframe.isdaily
+
+buy_condition = not use_cascade ? (touched_today and close > donchian_high_1d) : (buy_signal_1h or buy_signal_4h or buy_signal_1d)
+
+// =============================================================================
+// 4. SIMULACIÓN DE POSICIÓN Y DISPARO DE SEÑALES
+// =============================================================================
+bool signal_buy = false
+bool signal_exit_macd = false
+bool signal_exit_sl   = false
+
+if not in_position and buy_condition
+    in_position := true
+    entry_price := close
+    entry_tf    := timeframe.isdaily ? "1D" : (timeframe.multiplier <= 60 ? "1H" : "4H")
+    signal_buy  := true
+    
+    // Cálculo dinámico del Stop Loss según selección
+    if sl_mode == "Donchian Low 10D"
+        sl_price := donchian_low_1d
+    else if sl_mode == "ATR 1.0x"
+        sl_price := entry_price - (1.0 * atr_val_1d)
+    else if sl_mode == "ATR 1.5x"
+        sl_price := entry_price - (1.5 * atr_val_1d)
+    else if sl_mode == "Mínimo Vela Entrada"
+        sl_price := low < entry_price ? low : entry_price * 0.98
+
+    if sl_price >= entry_price
+        sl_price := entry_price * 0.98
+
+if in_position
+    // 1. Salida por Stop Loss
+    if low <= sl_price
+        signal_exit_sl := true
+        in_position    := false
+        trade_ret       = ((sl_price - entry_price) / entry_price) * 100 - 0.2 // 0.2% fee
+        total_return   += trade_ret
+        total_trades   += 1
+        sl_price       := na
+    // 2. Salida por Cruce Bajista de MACD (Take Profit)
+    else if macd_bear_cross
+        signal_exit_macd := true
+        in_position      := false
+        trade_ret         = ((close - entry_price) / entry_price) * 100 - 0.2 // 0.2% fee
+        total_return     += trade_ret
+        total_trades     += 1
+        if trade_ret > 0
+            win_trades   += 1
+        sl_price         := na
+
+// =============================================================================
+// 5. SEÑALES VISUALES Y ALERTAS EN EL GRÁFICO (PINE V6)
+// =============================================================================
+// Dibujar Señal de Compra (Flecha Verde Hacia Arriba)
+plotshape(show_shapes and signal_buy, title="Señal Compra", style=shape.triangleup, location=location.belowbar, color=#00E676, size=size.small, text="BUY")
+
+// Dibujar Señal de Salida por MACD (Flecha Azul Hacia Abajo)
+plotshape(show_shapes and signal_exit_macd, title="Salida MACD (TP)", style=shape.triangledown, location=location.abovebar, color=#2962FF, size=size.small, text="TAKE PROFIT")
+
+// Dibujar Señal de Salida por Stop Loss (Cruz Roja)
+plotshape(show_shapes and signal_exit_sl, title="Salida Stop Loss", style=shape.xcross, location=location.belowbar, color=#FF5252, size=size.small, text="STOP LOSS")
+
+// Dibujar Línea de Techo 10D y Stop Loss Activo
+plot(show_lines ? donchian_high_1d : na, "Techo Donchian 10D", color=color.new(#00E676, 10), linewidth=2, style=plot.style_stepline)
+plot(show_lines and in_position ? sl_price : na, "Stop Loss Activo", color=color.new(#FF5252, 0), linewidth=2, style=plot.style_linebr)
+
+// Colorear el fondo cuando la posición está activa
+bgcolor(in_position ? color.new(#00E676, 92) : na)
+
+// Configuración de Alertas para TradingView
+alertcondition(signal_buy, "Alerta Compra MTF 10D", "Señal de COMPRA activada en {{ticker}} (Cierre sobre Techo 10D)")
+alertcondition(signal_exit_macd, "Alerta Salida MACD (TP)", "Señal de SALIDA por Cruce Bajista MACD en {{ticker}}")
+alertcondition(signal_exit_sl, "Alerta Stop Loss Alcanzado", "Señal de STOP LOSS en {{ticker}}")
+
+// =============================================================================
+// 6. PANEL ESTADÍSTICO HUD EN PANTALLA (TABLE DASHBOARD V6)
+// =============================================================================
+var table hud = table.new(position.top_right, 2, 7, bgcolor=color.new(#1E222D, 10), border_color=color.new(#363A45, 0), border_width=1)
+
+if show_hud and barstate.islast
+    // Encabezado
+    table.cell(hud, 0, 0, "INDICADOR MTF 10D v6", 0, 0, text_color=color.white, text_size=size.small, bgcolor=color.new(#2962FF, 0))
+    table.cell(hud, 1, 0, "ESTADO EN VIVO", 0, 0, text_color=color.white, text_size=size.small, bgcolor=color.new(#2962FF, 0))
+    
+    // Métricas
+    win_rate = total_trades > 0 ? (win_trades / total_trades) * 100 : 0.0
+    
+    table.cell(hud, 0, 1, "Retorno Simulado Total", text_color=color.gray, text_size=size.small)
+    table.cell(hud, 1, 1, str.tostring(total_return, "+#.##") + "%", text_color=total_return >= 0 ? color.green : color.red, text_size=size.small)
+
+    table.cell(hud, 0, 2, "Win Rate (%)", text_color=color.gray, text_size=size.small)
+    table.cell(hud, 1, 2, str.tostring(win_rate, "#.#") + "%", text_color=color.white, text_size=size.small)
+
+    table.cell(hud, 0, 3, "Total Operaciones", text_color=color.gray, text_size=size.small)
+    table.cell(hud, 1, 3, str.tostring(total_trades, "#"), text_color=color.white, text_size=size.small)
+
+    table.cell(hud, 0, 4, "Techo 10D Actual", text_color=color.gray, text_size=size.small)
+    table.cell(hud, 1, 4, str.tostring(donchian_high_1d, "#.##"), text_color=color.green, text_size=size.small)
+
+    table.cell(hud, 0, 5, "Estado Posición", text_color=color.gray, text_size=size.small)
+    table.cell(hud, 1, 5, in_position ? "LONG ACTIVO (" + entry_tf + ")" : "EN ESPERA", text_color=in_position ? color.green : color.orange, text_size=size.small)
+
+    table.cell(hud, 0, 6, "Stop Loss Nivel", text_color=color.gray, text_size=size.small)
+    table.cell(hud, 1, 6, in_position ? str.tostring(sl_price, "#.##") : "-", text_color=color.red, text_size=size.small)

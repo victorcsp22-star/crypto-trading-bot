@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: quant-trading-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn web_runner:app --bind 0.0.0.0:$PORT --workers 1 --threads 2
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.12
+      - key: CHECK_INTERVAL_SECONDS
+        value: 180
+      - key: INITIAL_CAPITAL
+        value: 1000.0
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
